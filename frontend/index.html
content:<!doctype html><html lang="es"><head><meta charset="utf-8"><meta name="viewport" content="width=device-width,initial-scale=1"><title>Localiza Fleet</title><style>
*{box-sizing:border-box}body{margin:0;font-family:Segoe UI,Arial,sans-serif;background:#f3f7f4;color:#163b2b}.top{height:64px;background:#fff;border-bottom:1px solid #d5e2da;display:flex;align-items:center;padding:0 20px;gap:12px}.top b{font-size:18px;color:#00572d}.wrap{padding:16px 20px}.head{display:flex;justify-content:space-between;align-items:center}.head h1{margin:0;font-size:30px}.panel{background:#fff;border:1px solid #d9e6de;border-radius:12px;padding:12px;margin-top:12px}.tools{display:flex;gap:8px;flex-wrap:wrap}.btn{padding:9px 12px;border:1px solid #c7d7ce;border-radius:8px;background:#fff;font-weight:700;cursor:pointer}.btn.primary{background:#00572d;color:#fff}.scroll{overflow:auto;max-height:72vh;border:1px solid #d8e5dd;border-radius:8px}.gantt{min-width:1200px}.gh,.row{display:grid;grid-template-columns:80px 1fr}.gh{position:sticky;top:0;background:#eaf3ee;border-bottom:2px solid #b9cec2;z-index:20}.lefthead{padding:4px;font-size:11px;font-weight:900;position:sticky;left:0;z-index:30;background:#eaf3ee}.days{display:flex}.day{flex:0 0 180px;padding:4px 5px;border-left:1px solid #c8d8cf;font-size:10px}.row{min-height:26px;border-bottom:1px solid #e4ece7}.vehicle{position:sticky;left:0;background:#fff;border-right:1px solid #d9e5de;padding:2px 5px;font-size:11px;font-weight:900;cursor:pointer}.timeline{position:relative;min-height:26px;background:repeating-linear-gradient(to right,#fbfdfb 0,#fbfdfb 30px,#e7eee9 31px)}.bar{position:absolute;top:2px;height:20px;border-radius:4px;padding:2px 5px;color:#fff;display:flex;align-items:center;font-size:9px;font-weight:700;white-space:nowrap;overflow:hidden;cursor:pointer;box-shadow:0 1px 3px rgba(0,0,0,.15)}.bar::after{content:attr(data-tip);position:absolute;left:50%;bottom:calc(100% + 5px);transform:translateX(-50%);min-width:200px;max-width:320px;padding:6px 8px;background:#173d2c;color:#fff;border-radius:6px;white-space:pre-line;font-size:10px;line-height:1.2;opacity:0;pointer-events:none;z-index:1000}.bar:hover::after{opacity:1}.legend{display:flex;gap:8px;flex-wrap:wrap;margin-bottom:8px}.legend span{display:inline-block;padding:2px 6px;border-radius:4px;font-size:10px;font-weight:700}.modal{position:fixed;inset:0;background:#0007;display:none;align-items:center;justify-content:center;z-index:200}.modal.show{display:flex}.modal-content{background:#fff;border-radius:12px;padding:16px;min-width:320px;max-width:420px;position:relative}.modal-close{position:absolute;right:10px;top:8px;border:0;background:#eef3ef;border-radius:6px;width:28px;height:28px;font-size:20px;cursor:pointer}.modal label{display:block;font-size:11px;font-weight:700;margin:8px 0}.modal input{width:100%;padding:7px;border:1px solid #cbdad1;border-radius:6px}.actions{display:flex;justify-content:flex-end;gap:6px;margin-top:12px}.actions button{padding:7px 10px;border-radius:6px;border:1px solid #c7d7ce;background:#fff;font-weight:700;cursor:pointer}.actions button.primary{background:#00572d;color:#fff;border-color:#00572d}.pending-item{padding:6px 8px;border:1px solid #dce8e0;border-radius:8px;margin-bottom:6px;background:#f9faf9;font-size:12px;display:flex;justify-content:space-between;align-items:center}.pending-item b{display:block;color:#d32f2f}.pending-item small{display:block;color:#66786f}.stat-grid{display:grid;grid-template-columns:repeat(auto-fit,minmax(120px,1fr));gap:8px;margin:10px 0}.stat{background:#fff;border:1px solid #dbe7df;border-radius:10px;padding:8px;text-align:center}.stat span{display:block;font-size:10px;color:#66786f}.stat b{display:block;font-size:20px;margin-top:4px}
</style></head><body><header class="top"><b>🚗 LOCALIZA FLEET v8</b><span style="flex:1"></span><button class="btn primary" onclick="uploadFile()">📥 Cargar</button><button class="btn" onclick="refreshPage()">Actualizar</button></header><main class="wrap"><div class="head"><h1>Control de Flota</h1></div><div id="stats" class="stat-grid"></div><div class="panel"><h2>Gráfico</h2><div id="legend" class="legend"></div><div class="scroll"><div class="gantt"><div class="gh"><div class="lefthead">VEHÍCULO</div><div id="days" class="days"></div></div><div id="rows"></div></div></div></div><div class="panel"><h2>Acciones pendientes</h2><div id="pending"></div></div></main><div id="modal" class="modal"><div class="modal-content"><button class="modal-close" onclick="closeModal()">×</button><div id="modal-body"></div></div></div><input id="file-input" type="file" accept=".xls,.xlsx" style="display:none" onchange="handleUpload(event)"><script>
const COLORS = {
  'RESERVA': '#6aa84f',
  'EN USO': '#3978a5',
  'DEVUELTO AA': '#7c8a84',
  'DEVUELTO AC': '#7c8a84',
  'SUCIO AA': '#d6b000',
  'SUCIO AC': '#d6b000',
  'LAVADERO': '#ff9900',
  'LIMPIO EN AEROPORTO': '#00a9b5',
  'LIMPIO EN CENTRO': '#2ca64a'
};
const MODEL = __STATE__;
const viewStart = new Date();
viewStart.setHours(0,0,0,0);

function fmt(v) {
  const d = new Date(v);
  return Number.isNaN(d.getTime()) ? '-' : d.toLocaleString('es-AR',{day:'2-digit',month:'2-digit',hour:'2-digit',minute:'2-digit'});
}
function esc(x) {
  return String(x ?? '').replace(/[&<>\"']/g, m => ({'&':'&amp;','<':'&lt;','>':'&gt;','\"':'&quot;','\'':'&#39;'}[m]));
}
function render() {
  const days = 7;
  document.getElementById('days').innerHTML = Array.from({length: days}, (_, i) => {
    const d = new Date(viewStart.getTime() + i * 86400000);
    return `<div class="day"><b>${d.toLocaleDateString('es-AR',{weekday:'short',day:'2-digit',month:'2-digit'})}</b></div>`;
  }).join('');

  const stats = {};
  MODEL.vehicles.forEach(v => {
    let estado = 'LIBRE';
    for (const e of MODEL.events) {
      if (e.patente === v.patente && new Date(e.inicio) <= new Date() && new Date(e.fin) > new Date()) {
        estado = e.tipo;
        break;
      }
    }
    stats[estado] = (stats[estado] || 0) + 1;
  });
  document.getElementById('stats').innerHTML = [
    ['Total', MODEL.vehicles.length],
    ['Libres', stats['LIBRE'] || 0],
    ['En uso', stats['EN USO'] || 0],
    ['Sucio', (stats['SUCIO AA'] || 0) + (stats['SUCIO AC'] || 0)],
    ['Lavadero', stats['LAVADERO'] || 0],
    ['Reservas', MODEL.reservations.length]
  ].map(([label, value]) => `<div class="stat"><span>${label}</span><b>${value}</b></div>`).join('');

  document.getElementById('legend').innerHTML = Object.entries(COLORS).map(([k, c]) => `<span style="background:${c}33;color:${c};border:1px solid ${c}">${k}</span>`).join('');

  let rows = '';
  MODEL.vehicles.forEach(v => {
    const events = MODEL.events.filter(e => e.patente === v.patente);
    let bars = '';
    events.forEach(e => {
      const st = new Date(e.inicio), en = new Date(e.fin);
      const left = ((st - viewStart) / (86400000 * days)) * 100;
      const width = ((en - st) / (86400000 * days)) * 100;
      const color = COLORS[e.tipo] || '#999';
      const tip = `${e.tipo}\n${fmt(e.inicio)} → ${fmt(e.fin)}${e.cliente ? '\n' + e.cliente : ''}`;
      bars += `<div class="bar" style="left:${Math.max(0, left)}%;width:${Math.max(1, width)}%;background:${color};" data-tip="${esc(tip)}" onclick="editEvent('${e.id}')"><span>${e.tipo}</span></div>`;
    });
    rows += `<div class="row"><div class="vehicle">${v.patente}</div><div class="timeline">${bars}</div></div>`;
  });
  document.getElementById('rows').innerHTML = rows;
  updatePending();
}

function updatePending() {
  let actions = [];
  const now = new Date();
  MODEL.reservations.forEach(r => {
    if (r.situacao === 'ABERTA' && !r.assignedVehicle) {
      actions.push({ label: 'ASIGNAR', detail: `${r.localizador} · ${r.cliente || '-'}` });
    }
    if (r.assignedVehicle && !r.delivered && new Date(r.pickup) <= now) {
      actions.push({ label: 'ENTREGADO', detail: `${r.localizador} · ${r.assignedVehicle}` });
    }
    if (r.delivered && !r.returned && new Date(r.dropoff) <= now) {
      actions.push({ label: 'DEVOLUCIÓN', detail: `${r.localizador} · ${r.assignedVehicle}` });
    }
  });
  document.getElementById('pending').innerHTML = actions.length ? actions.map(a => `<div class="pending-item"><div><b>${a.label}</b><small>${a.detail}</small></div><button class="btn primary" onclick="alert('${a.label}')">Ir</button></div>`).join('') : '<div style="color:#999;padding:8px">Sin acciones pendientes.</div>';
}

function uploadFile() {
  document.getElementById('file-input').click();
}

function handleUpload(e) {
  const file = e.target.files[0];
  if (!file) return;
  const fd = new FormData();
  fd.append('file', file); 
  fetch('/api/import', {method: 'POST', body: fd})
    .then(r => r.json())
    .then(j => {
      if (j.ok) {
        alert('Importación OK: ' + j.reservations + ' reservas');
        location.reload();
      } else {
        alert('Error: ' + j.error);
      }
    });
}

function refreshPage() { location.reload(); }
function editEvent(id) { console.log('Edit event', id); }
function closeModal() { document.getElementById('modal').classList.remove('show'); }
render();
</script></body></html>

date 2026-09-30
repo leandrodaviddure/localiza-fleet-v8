@@ -1,0 +1,371 @@
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
+import json, os, subprocess, tempfile, datetime, sys, re, unicodedata, uuid, webbrowser, time
+
+ROOT = Path(__file__).parent
+DATA_DIR = ROOT / 'data'
+DATA_DIR.mkdir(exist_ok=True)
+
+MODEL_FILE = DATA_DIR / 'state.json'
+AUDIT_LOG = DATA_DIR / 'audit.log'
+
+try:
+    from openpyxl import load_workbook
+except Exception:
+    subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'openpyxl'])
+    from openpyxl import load_workbook
+
+PORT = 5173
+VERSION = 'v8.0-core'
+
+
+def norm(s):
+    t = str(s or '').strip().upper()
+    t = ''.join(ch for ch in unicodedata.normalize('NFD', t) if unicodedata.category(ch) != 'Mn')
+    return re.sub(r'\s+', ' ', t).strip()
+
+
+def iso(v):
+    if isinstance(v, datetime.datetime):
+        return v.isoformat()
+    if isinstance(v, datetime.date):
+        return datetime.datetime.combine(v, datetime.time()).isoformat()
+    s = str(v or '').strip()
+    if not s:
+        return ''
+    formats = (
+        '%d/%m/%Y %H:%M:%S', '%d/%m/%Y %H:%M', '%d/%m/%Y',
+        '%d-%m-%Y %H:%M:%S', '%d-%m-%Y %H:%M', '%d-%m-%Y',
+        '%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d',
+        '%Y/%m/%d %H:%M:%S', '%Y/%m/%d %H:%M', '%Y/%m/%d'
+    )
+    for f in formats:
+        try:
+            return datetime.datetime.strptime(s, f).isoformat()
+        except ValueError:
+            pass
+    try:
+        return datetime.datetime.fromisoformat(s.replace('Z', '+00:00')).isoformat()
+    except Exception:
+        pass
+    return s
+
+
+class OperationalModel:
+    def __init__(self):
+        self.vehicles = {}
+        self.reservations = {}
+        self.events = []
+        self.load()
+
+    def load(self):
+        if MODEL_FILE.exists():
+            try:
+                data = json.loads(MODEL_FILE.read_text(encoding='utf-8'))
+                self.vehicles = data.get('vehicles', {})
+                self.reservations = data.get('reservations', {})
+                self.events = data.get('events', [])
+            except Exception:
+                pass
+
+    def persist(self):
+        MODEL_FILE.write_text(json.dumps({
+            'vehicles': self.vehicles,
+            'reservations': self.reservations,
+            'events': self.events,
+        }, ensure_ascii=False), encoding='utf-8')
+
+    def audit(self, action, detail):
+        line = json.dumps({'time': datetime.datetime.utcnow().isoformat(), 'action': action, 'detail': detail}, ensure_ascii=False) + '\n'
+        try:
+            with AUDIT_LOG.open('a', encoding='utf-8') as fh:
+                fh.write(line)
+        except Exception:
+            pass
+
+    def import_reservations(self, payload):
+        for item in payload.get('reservations', []):
+            loc = str(item.get('localizador', '')).strip().upper()
+            if not loc:
+                continue
+            if loc in self.reservations:
+                self.reservations[loc].update(item)
+            else:
+                self.reservations[loc] = item
+        self.persist()
+        self.audit('import_reservations', {'count': len(payload.get('reservations', []))})
+
+    def add_event(self, tipo, patente, inicio, fin, localizador=None, cliente=None, grupo=None, source='manual'):
+        self.events.append({
+            'id': f'evt-{uuid.uuid4().hex[:12]}',
+            'tipo': tipo,
+            'patente': patente,
+            'inicio': inicio,
+            'fin': fin,
+            'localizador': localizador,
+            'cliente': cliente,
+            'grupo': grupo,
+            'source': source,
+            'created_at': datetime.datetime.utcnow().isoformat(),
+        })
+        self.persist()
+
+    def deliver_vehicle(self, localizador, real_time):
+        if localizador not in self.reservations:
+            return False
+        r = self.reservations[localizador]
+        r['delivered'] = True
+        r['delivery_real'] = real_time
+        self.add_event('EN USO', r.get('assignedVehicle', ''), real_time, r.get('dropoff', ''), localizador=localizador, cliente=r.get('cliente'), grupo=r.get('grupo'), source='operational')
+        self.audit('deliver_vehicle', {'localizador': localizador, 'patente': r.get('assignedVehicle'), 'real_time': real_time})
+        return True
+
+    def return_vehicle(self, localizador, real_time):
+        if localizador not in self.reservations:
+            return False
+        r = self.reservations[localizador]
+        r['returned'] = True
+        r['return_real'] = real_time
+        agency = 'AAUSH' if 'AAUSH' in (str(r.get('agencia_devolucion') or r.get('agencia_salida') or '')).upper() else 'ACUSH'
+        end1 = (datetime.datetime.fromisoformat(real_time) + datetime.timedelta(hours=1)).isoformat()
+        self.add_event('DEVUELTO AA' if agency == 'AAUSH' else 'DEVUELTO AC', r.get('assignedVehicle', ''), real_time, end1, localizador=localizador, source='operational')
+        end2 = (datetime.datetime.fromisoformat(real_time) + datetime.timedelta(hours=48)).isoformat()
+        self.add_event('SUCIO AA' if agency == 'AAUSH' else 'SUCIO AC', r.get('assignedVehicle', ''), real_time, end2, localizador=localizador, source='operational')
+        self.audit('return_vehicle', {'localizador': localizador, 'patente': r.get('assignedVehicle'), 'real_time': real_time})
+        return True
+
+    def wash_vehicle(self, patente, real_time):
+        end = (datetime.datetime.fromisoformat(real_time) + datetime.timedelta(hours=2)).isoformat()
+        self.add_event('LAVADERO', patente, real_time, end, source='operational')
+        self.audit('wash_vehicle', {'patente': patente, 'real_time': real_time})
+        return True
+
+    def clean_vehicle(self, patente, destination, real_time):
+        tipo = 'LIMPIO EN AEROPORTO' if destination.upper() in ['AEROPORTO', 'AAUSH'] else 'LIMPIO EN CENTRO'
+        end = (datetime.datetime.fromisoformat(real_time) + datetime.timedelta(hours=1)).isoformat()
+        self.add_event(tipo, patente, real_time, end, source='operational')
+        self.audit('clean_vehicle', {'patente': patente, 'destination': destination, 'real_time': real_time})
+        return True
+
+
+def read_xls_rows(path):
+    wb = load_workbook(path, data_only=True, read_only=True)
+    ws = wb[wb.sheetnames[0]]
+    return [tuple(r) for r in ws.iter_rows(values_only=True)]
+
+
+def import_reservation_file(path):
+    src = Path(path)
+    if src.suffix.lower() == '.xls':
+        rows_by_sheet = [('Hoja 1', read_xls_rows(src))]
+    else:
+        wb = load_workbook(src, data_only=True, read_only=True)
+        rows_by_sheet = [(sname, [tuple(r) for r in wb[sname].iter_rows(values_only=True)]) for sname in wb.sheetnames]
+
+    def find_header(rows):
+        for i, row in enumerate(rows[:80]):
+            vals = [norm(x) for x in row]
+            if any('LOCALIZADOR' in v for v in vals) and any('SITUACAO' in v or 'SITUACION' in v for v in vals):
+                return i, vals
+        return -1, None
+
+    selected = None
+    for sname, rows in rows_by_sheet:
+        hi, headers = find_header(rows)
+        if hi >= 0:
+            selected = (sname, rows, hi, headers)
+            break
+    if not selected:
+        raise ValueError('No se encontró encabezado de Reserva Analítico válido.')
+
+    sname, rows, hi, headers = selected
+
+    def ix(*names):
+        wanted = {norm(n) for n in names}
+        for j, h in enumerate(headers):
+            if h in wanted:
+                return j
+        return -1
+
+    cols = {
+        'situacao': ix('SITUACAO', 'SITUACION', 'STATUS'),
+        'agenciaSalida': ix('AGENCIA SAIDA', 'AGENCIA SALIDA'),
+        'agenciaDevolucao': ix('AGENCIA DEVOLUCION', 'AGENCIA DEVOLUCAO'),
+        'cliente': ix('CLIENTE', 'NOMBRE CLIENTE', 'NOME CLIENTE'),
+        'grupo': ix('GRUPO', 'CATEGORIA'),
+        'pickup': ix('DATA RETIRADA', 'DATA/HORA RETIRADA', 'FECHA RETIRADA'),
+        'dropoff': ix('DATA DEVOLUCION', 'DATA/HORA DEVOLUCION', 'FECHA DEVOLUCION'),
+    }
+    loc_i = ix('LOCALIZADOR', 'LOCALIZADOR RESERVA', 'CODIGO RESERVA')
+    out = []
+    for row in rows[hi + 1:]:
+        if loc_i < 0 or loc_i >= len(row):
+            continue
+        loc = str(row[loc_i] or '').strip().upper()
+        if not loc:
+            continue
+        sit = row[cols['situacao']] if cols['situacao'] >= 0 and cols['situacao'] < len(row) else ''
+        if not str(sit or '').strip():
+            continue
+        item = {'localizador': loc}
+        for key, idx in cols.items():
+            val = row[idx] if idx >= 0 and idx < len(row) else ''
+            item[key] = iso(val) if key in ('pickup', 'dropoff') else str(val or '').strip()
+        out.append(item)
+    return {'kind': 'reservations', 'reservations': out, 'source': src.name}
+
+
+model = OperationalModel()
+
+
+def inicializar_vehiculos_base():
+    # Datos base del usuario
+    base = [
+        {'patente': 'AG089HZ', 'grupo': 'CE'},
+        {'patente': 'AF965XE', 'grupo': 'CE'},
+        {'patente': 'AG667YG', 'grupo': 'CE'},
+        {'patente': 'AG667YJ', 'grupo': 'CE'},
+        {'patente': 'AG777UP', 'grupo': 'CE'},
+        {'patente': 'AI021FQ', 'grupo': 'CE'},
+        {'patente': 'AI045LS', 'grupo': 'CE'},
+        {'patente': 'AF763HC', 'grupo': 'FS'},
+        {'patente': 'AF920BZ', 'grupo': 'FS'},
+        {'patente': 'AF815DK', 'grupo': 'FS'},
+        {'patente': 'AG022WH', 'grupo': 'FS'},
+        {'patente': 'AF763HB', 'grupo': 'FS'},
+        {'patente': 'AG022WI', 'grupo': 'FS'},
+        {'patente': 'AG089HY', 'grupo': 'FS'},
+        {'patente': 'AG204KV', 'grupo': 'FS'},
+        {'patente': 'AG204KS', 'grupo': 'FS'},
+        {'patente': 'AG204KT', 'grupo': 'FS'},
+        {'patente': 'AF559AV', 'grupo': 'FS'},
+        {'patente': 'AF559AW', 'grupo': 'FS'},
+        {'patente': 'AF815DJ', 'grupo': 'FS'},
+        {'patente': 'AF965XC', 'grupo': 'FS'},
+        {'patente': 'AG089GO', 'grupo': 'FS'},
+        {'patente': 'AG089GP', 'grupo': 'FS'},
+        {'patente': 'AG089HN', 'grupo': 'FS'},
+        {'patente': 'AG089HP', 'grupo': 'FS'},
+        {'patente': 'AG089HX', 'grupo': 'FS'},
+        {'patente': 'AG140DA', 'grupo': 'FS'},
+        {'patente': 'AG204KU', 'grupo': 'FS'},
+        {'patente': 'AG204KW', 'grupo': 'FS'},
+        {'patente': 'AG263KN', 'grupo': 'FS'},
+        {'patente': 'AG667YH', 'grupo': 'FS'},
+        {'patente': 'AG667YI', 'grupo': 'FS'},
+        {'patente': 'AG204KZ', 'grupo': 'FX'},
+        {'patente': 'AG204KX', 'grupo': 'FX'},
+        {'patente': 'AG204KY', 'grupo': 'FX'},
+        {'patente': 'AG263KO', 'grupo': 'FX'},
+        {'patente': 'AG263KP', 'grupo': 'FX'},
+        {'patente': 'AG320JM', 'grupo': 'FX'},
+        {'patente': 'AG320JL', 'grupo': 'FX'},
+        {'patente': 'AG320JJ', 'grupo': 'FX'},
+        {'patente': 'AG320JN', 'grupo': 'FX'},
+        {'patente': 'AG320JR', 'grupo': 'FX'},
+        {'patente': 'AG427GB', 'grupo': 'FX'},
+        {'patente': 'AG427GA', 'grupo': 'FX'},
+        {'patente': 'AG374OY', 'grupo': 'FX'},
+        {'patente': 'AG777UN', 'grupo': 'FX'},
+        {'patente': 'AG886AA', 'grupo': 'FX'},
+        {'patente': 'AG886AB', 'grupo': 'FX'},
+        {'patente': 'AH021JO', 'grupo': 'FX'},
+        {'patente': 'AH111VF', 'grupo': 'L'},
+        {'patente': 'AI196DD', 'grupo': 'G'},
+        {'patente': 'AI045LR', 'grupo': 'G'},
+        {'patente': 'AF815EY', 'grupo': 'GX'},
+        {'patente': 'AF662ZM', 'grupo': 'GX'},
+        {'patente': 'AG535EQ', 'grupo': 'LE'},
+        {'patente': 'AG022XJ', 'grupo': 'LE'},
+        {'patente': 'AF447AB', 'grupo': 'LE'},
+        {'patente': 'AG320JK', 'grupo': 'P'},
+        {'patente': 'AG089HQ', 'grupo': 'P'},
+        {'patente': 'AF173TL', 'grupo': 'P'},
+    ]
+
+    for item in base:
+        model.vehicles[item['patente']] = {'patente': item['patente'], 'grupo': item['grupo']}
+    model.persist()
+
+
+if not model.vehicles:
+    inicializar_vehiculos_base()
+
+
+class H(BaseHTTPRequestHandler):
+    def send(self, code, ctype, data):
+        self.send_response(code)
+        self.send_header('Content-Type', ctype)
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path == '/':
+            state = {
+                'vehicles': list(model.vehicles.values()),
+                'reservations': list(model.reservations.values()),
+                'events': model.events,
+            }
+            html = (ROOT / 'frontend' / 'index.html').read_text(encoding='utf-8').replace('__STATE__', json.dumps(state, ensure_ascii=False))
+            self.send(200, 'text/html; charset=utf-8', html.encode('utf-8'))
+        elif self.path == '/favicon.ico':
+            self.send(404, 'text/plain', b'No favicon')
+        else:
+            self.send(404, 'text/plain', b'Not found')
+
+    def do_POST(self):
+        if self.path == '/api/import':
+            try:
+                ctype = self.headers.get('Content-Type', '')
+                boundary = ctype.split('boundary=', 1)[1].encode() if 'boundary=' in ctype else None
+                if not boundary:
+                    raise ValueError('Carga multipart inválida')
+                length = int(self.headers.get('Content-Length', '0'))
+                body = self.rfile.read(length)
+                filedata = None
+                filename = 'reservas.xlsx'
+                for part in body.split(b'--' + boundary):
+                    if b'filename=' not in part:
+                        continue
+                    head, _, data = part.partition(b'\r\n\r\n')
+                    m = re.search(br'filename="([^"]+)"', head)
+                    if m:
+                        filename = m.group(1).decode('utf-8', 'ignore')
+                    filedata = data.rstrip(b'\r\n-')
+                    break
+                if filedata is None:
+                    raise ValueError('Archivo no recibido')
+                td = Path(tempfile.mkdtemp())
+                p = td / filename
+                p.write_bytes(filedata)
+                payload = import_reservation_file(p)
+                model.import_reservations(payload)
+                self.send(200, 'application/json', json.dumps({'ok': True, 'reservations': len(payload.get('reservations', []))}).encode())
+            except Exception as e:
+                self.send(400, 'application/json', json.dumps({'ok': False, 'error': str(e)}).encode())
+        elif self.path == '/api/deliver':
+            try:
+                data = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))))
+                ok = model.deliver_vehicle(data['localizador'], data['real_time'])
+                self.send(200, 'application/json', json.dumps({'ok': ok}).encode())
+            except Exception as e:
+                self.send(400, 'application/json', json.dumps({'ok': False, 'error': str(e)}).encode())
+        elif self.path == '/api/return':
+            try:
+                data = json.loads(self.rfile.read(int(self.headers.get('Content-Length', 0))))
+                ok = model.return_vehicle(data['localizador'], data['real_time'])
+                self.send(200, 'application/json', json.dumps({'ok': ok}).encode())
+            except Exception as e:
+                self.send(400, 'application/json', json.dumps({'ok': False, 'error': str(e)}).encode())
+        else:
+            self.send(404, 'application/json', b'{"ok": false, "error": "ruta no encontrada"}')
+
+
+if __name__ == '__main__':
+    print(f'LOCALIZA FLEET {VERSION} - http://localhost:{PORT}')
+    try:
+        webbrowser.open(f'http://127.0.0.1:{PORT}')
+    except Exception:
+        pass
+    ThreadingHTTPServer(('127.0.0.1', PORT), H).serve_forever()
